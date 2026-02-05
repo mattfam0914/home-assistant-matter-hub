@@ -1,5 +1,3 @@
-// FILE: packages/backend/src/matter/behaviors/thermostat-server.ts
-
 import type { HomeAssistantEntityInformation } from "@home-assistant-matter-hub/common";
 import { ThermostatServer as Base } from "@matter/main/behaviors";
 import { Thermostat } from "@matter/main/clusters";
@@ -78,12 +76,11 @@ export class ThermostatServerBase extends FeaturedBase {
     this.reactTo(homeAssistant.onChange, this.update);
   }
 
-  private update = (entity: HomeAssistantEntityInformation) => {
+  private update(entity: HomeAssistantEntityInformation) {
     const config = this.state.config;
 
-    // Matter Thermostat units are 0.01°C
-    const haMin = config.getMinTemperature(entity.state, this.agent)?.celsius(true);
-    const haMax = config.getMaxTemperature(entity.state, this.agent)?.celsius(true);
+    const rawMin = config.getMinTemperature(entity.state, this.agent)?.celsius(true);
+    const rawMax = config.getMaxTemperature(entity.state, this.agent)?.celsius(true);
 
     const localTemperature = config
       .getCurrentTemperature(entity.state, this.agent)
@@ -94,7 +91,6 @@ export class ThermostatServerBase extends FeaturedBase {
         .getTargetHeatingTemperature(entity.state, this.agent)
         ?.celsius(true) ?? this.state.occupiedHeatingSetpoint;
 
-    // FIX: this previously called getTargetHeatingTemperature by mistake
     const targetCoolingTemperature =
       config
         .getTargetCoolingTemperature(entity.state, this.agent)
@@ -103,98 +99,58 @@ export class ThermostatServerBase extends FeaturedBase {
     const systemMode = this.getSystemMode(entity);
     const runningMode = config.getRunningMode(entity.state, this.agent);
 
-    // Matter enforces a deadband when AutoMode (Heat+Cool/Range) is supported.
-    // Deadband units are 0.01°C (200 = 2.00°C).
-    const deadband =
-      this.features.autoMode && this.features.heating && this.features.cooling ? 200 : 0;
+    // Matter Thermostat cluster uses centi-degrees Celsius.
+    // Some Matter implementations enforce:
+    //   minHeat <= minCool - deadband   and   maxHeat <= maxCool - deadband
+    // If we set identical heat/cool limits while the default deadband is 2°C (200),
+    // the node can crash with a ConstraintError during initialization.
+    let deadband = this.features.autoMode ? 0 : (this.state.minSetpointDeadBand ?? 200);
 
-    // Start with HA's min/max (if present)
-    let minHeat = haMin;
-    let maxHeat = haMax;
-    let minCool = haMin;
-    let maxCool = haMax;
+    let minHeatSetpointLimit = rawMin;
+    let maxHeatSetpointLimit = rawMax;
+    let minCoolSetpointLimit = rawMin;
+    let maxCoolSetpointLimit = rawMax;
 
-    // If we have both heating & cooling + deadband, make the limits Matter-compliant:
-    // minHeat <= minCool - deadband
-    // maxHeat <= maxCool - deadband
-    if (this.features.heating && this.features.cooling && deadband > 0) {
-      if (minHeat != null && minCool != null) {
-        minCool = Math.max(minCool, minHeat + deadband);
+    if (rawMin !== undefined && rawMax !== undefined) {
+      if (rawMin + deadband > rawMax) {
+        deadband = 0;
       }
-      if (maxHeat != null && maxCool != null) {
-        maxHeat = Math.min(maxHeat, maxCool - deadband);
-      }
-    }
-
-    // Ensure ranges remain valid if HA reports a narrow range
-    if (minHeat != null && maxHeat != null && maxHeat < minHeat) {
-      maxHeat = minHeat;
-    }
-    if (minCool != null && maxCool != null && maxCool < minCool) {
-      maxCool = minCool;
-    }
-
-    // Clamp setpoints so they never violate deadband during endpoint init
-    let heatSp = targetHeatingTemperature;
-    let coolSp = targetCoolingTemperature;
-
-    if (this.features.heating && this.features.cooling && deadband > 0) {
-      if (heatSp != null && coolSp != null && heatSp > coolSp - deadband) {
-        // Prefer keeping heat as-is and pushing cool up to satisfy deadband
-        coolSp = heatSp + deadband;
-      }
-
-      // Respect max limits if we have them; then re-assert relationship
-      if (maxCool != null && coolSp != null) {
-        coolSp = Math.min(coolSp, maxCool);
-      }
-      if (coolSp != null && heatSp != null && heatSp > coolSp - deadband) {
-        heatSp = coolSp - deadband;
-      }
-
-      // Finally respect mins
-      if (minHeat != null && heatSp != null) {
-        heatSp = Math.max(heatSp, minHeat);
-      }
-      if (minCool != null && coolSp != null) {
-        coolSp = Math.max(coolSp, minCool);
-      }
+      minHeatSetpointLimit = rawMin;
+      maxCoolSetpointLimit = rawMax;
+      minCoolSetpointLimit = rawMin + deadband;
+      maxHeatSetpointLimit = rawMax - deadband;
     }
 
     applyPatchState(this.state, {
       localTemperature: localTemperature,
       systemMode: systemMode,
       thermostatRunningState: this.getRunningState(systemMode, runningMode),
-
       ...(this.features.heating
         ? {
-            occupiedHeatingSetpoint: heatSp,
-            minHeatSetpointLimit: minHeat,
-            maxHeatSetpointLimit: maxHeat,
-            absMinHeatSetpointLimit: minHeat,
-            absMaxHeatSetpointLimit: maxHeat,
+            occupiedHeatingSetpoint: targetHeatingTemperature,
+            minHeatSetpointLimit: minHeatSetpointLimit,
+            maxHeatSetpointLimit: maxHeatSetpointLimit,
+            absMinHeatSetpointLimit: minHeatSetpointLimit,
+            absMaxHeatSetpointLimit: maxHeatSetpointLimit,
           }
         : {}),
-
       ...(this.features.cooling
         ? {
-            occupiedCoolingSetpoint: coolSp,
-            minCoolSetpointLimit: minCool,
-            maxCoolSetpointLimit: maxCool,
-            absMinCoolSetpointLimit: minCool,
-            absMaxCoolSetpointLimit: maxCool,
+            occupiedCoolingSetpoint: targetCoolingTemperature,
+            minCoolSetpointLimit: minCoolSetpointLimit,
+            maxCoolSetpointLimit: maxCoolSetpointLimit,
+            absMinCoolSetpointLimit: minCoolSetpointLimit,
+            absMaxCoolSetpointLimit: maxCoolSetpointLimit,
           }
         : {}),
-
       ...(this.features.autoMode
         ? {
-            // Use the same deadband we enforce above so Matter doesn't “surprise” us later
             minSetpointDeadBand: deadband,
             thermostatRunningMode: runningMode,
           }
         : {}),
     });
-  };
+  }
 
   override setpointRaiseLower(request: Thermostat.SetpointRaiseLowerRequest) {
     const config = this.state.config;
